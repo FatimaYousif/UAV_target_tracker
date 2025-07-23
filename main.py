@@ -20,12 +20,11 @@ import time
 import tf2_py as tf
 import pyrealsense2 as rs2
 
-from px4_msgs.msg import VehicleLocalPosition, SensorGps, VehicleAttitude, TrajectorySetpoint, VehicleGlobalPosition
+from px4_msgs.msg import VehicleLocalPosition, SensorGps, VehicleAttitude, TrajectorySetpoint
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 
 from ultralytics_ros.msg import YoloResult
 from tf2_geometry_msgs.tf2_geometry_msgs import do_transform_pose
-from scipy.spatial.transform import Rotation as R
 
 class Point:
     def __init__(self, x=0, y=0):
@@ -79,7 +78,11 @@ class FollowTarget(Node):
     def __init__(self):
         super().__init__('follow_target')
         print("Node started")
-        
+        time.sleep(1)  # Brief pause to catch early messages
+
+
+        # print("Initializing Kalman Filters...")
+  
         # Kalman Filter initialization
         self.KF = KalmanFilter(dim_x=6, dim_z=4)
         self.KF.H = np.array([[1, 0, 0, 0, 0, 0],
@@ -109,6 +112,8 @@ class FollowTarget(Node):
                                    [0, 0, 1, 0],
                                    [0, 0, 0, 1]])
 
+        # print("Initializing variables...")
+   
         # Initialize variables
         self.intrinsics = None
         self.target_position = Point()
@@ -132,12 +137,12 @@ class FollowTarget(Node):
         self.target_hdg = 0
         
         # Controller gains
-        self.kh = 0.5
+        self.kh = 0.3
         self.kh2 = 0.6
-        self.kp_vel = 0.8
+        self.kp_vel = 0.35
         self.kd_vel = 0.0
         self.ki_vel = 0.01
-        self.kp_altitude = 1.2
+        self.kp_altitude = 0.8
         self.alpha = 0.10
         self.filtered_value = None
         
@@ -192,8 +197,8 @@ class FollowTarget(Node):
             
     
         self.altitude_sub = self.create_subscription(
-            VehicleGlobalPosition, 
-            '/fmu/out/vehicle_global_position', 
+            SensorGps, 
+            '/fmu/out/vehicle_gps_position', 
             self.get_altitude, 
             qos_profile=qos_profile)
         
@@ -207,6 +212,9 @@ class FollowTarget(Node):
             # qos_profile=qos_profile
             10)
         
+
+        # print(self.target_sub)
+            
             
         self.heading_sub = self.create_subscription(
             VehicleAttitude, 
@@ -231,27 +239,12 @@ class FollowTarget(Node):
             10)
 
     def odometry_callback(self, msg):
+        # print("Odometry callback triggered!")  # Debug
         self.uav_pose.x = msg.x
         self.uav_pose.y = msg.y
         self.uav_pose.z = msg.z
         # print(self.uav_pose.x)
 
-
-    # TODO 
-    def target_coordinates_test(self, distance, center_x, center_y, heading):
-        """
-        Calculate target coordinates in world frame based on camera detection.
-        
-        Args:
-            distance: Estimated distance to target (meters)
-            center_x: X coordinate of target center in image (pixels)
-            center_y: Y coordinate of target center in image (pixels)
-            heading: Current drone heading (radians)
-            
-        Returns:
-            tuple: (target_x, target_y) in world coordinates
-        """
-        pass
 
     def calculate_iou(self, box1, box2):
         x1, y1, w1, h1 = box1
@@ -278,19 +271,25 @@ class FollowTarget(Node):
         return intersection_area / union_area if union_area > 0 else 0
 
     def get_altitude(self, msg):
-        self.altitude = msg.alt
+        self.altitude = msg.altitude_msl_m
         # print(self.altitude)
 
-    def create_velocity_msg(self, Vx, Vy, Vz, yaw_rate):
+    def create_trajectory_setpoint(self, vx, vy, vz, yaw_rate, altitude):
         msg = TrajectorySetpoint()
-        msg.velocity[0] = Vx
-        msg.velocity[2] = -Vz
-        msg.yawspeed = float(yaw_rate)        
-        self.target_detected = True
+        msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)  # microseconds
+        
+        msg.velocity = [float(vx), float(vy), float(vz)]
 
-        print(f"Setpoint NED: Vx={Vx}, Vy={Vy}, Vz={Vz}")
+        
+        # Yaw control
+        msg.yawspeed = float(yaw_rate)
+        
+        # Altitude control (position)
+        msg.position[2] = float(-altitude)  # NED frame (negative for altitude)
+        
+        
+        self.target_detected = True
         return msg
-    
 
     def RateLimiter(self, new_value):
         current_time = time.time()
@@ -321,34 +320,78 @@ class FollowTarget(Node):
         else:
             self.filtered_value = self.alpha * new_value + (1 - self.alpha) * self.filtered_value
         return self.filtered_value
+    
+    def transform_coordinates(self, fcu_coordinates):
+        source_frame = "camera_link" 
+        target_frame = "map"
+        print("transforms prepared")
+        try:
+            transformed_stamped = self.tf_buffer.lookup_transform(
+                target_frame, 
+                source_frame, 
+                rclpy.time.Time(seconds=0))
+            # world_coordinates = tf2_geometry_msgs.do_transform_pose(
+            #     fcu_coordinates, 
+            #     transformed_stamped)
+            world_coordinates = do_transform_pose(fcu_coordinates.pose, transformed_stamped)
+            # return world_coordinates.pose.position.x, world_coordinates.pose.position.y
+            return world_coordinates.position.x, world_coordinates.position.y
+        except (tf2_ros.LookupException, 
+               tf2_ros.ConnectivityException, 
+               tf2_ros.ExtrapolationException) as e:
+            self.get_logger().error(f'Transform error: {str(e)}')
+            return None, None
+
+    def target_coordinates_test(self, distance, center_x, center_y, heading):
+        
+        print("ppx: ", self.ppx)
+        print("fx: ", self.fx)
+        print("fy: ", self.fy)
+    
+
+        z0 = distance * np.sqrt(1/(1+((center_x - self.ppx)/self.fx)))
+        
+        X_camera = (center_x - self.ppx) * z0 / self.fx
+        Y_camera = (center_y - self.ppy) * z0 / self.fy
+        Z_camera = z0
+
+        print("\ndistance", distance)
+        print("center_x", center_x)
+        print("center_y", center_y)    
+        print("heading", heading)
+        
+        point = PoseStamped()
+        point.pose.position.x = float(X_camera)
+        point.pose.position.y = float(Y_camera)
+        point.pose.position.z = float(Z_camera)
+
+        point.pose.orientation.x = 0.0
+        point.pose.orientation.y = 0.0
+        point.pose.orientation.z = 0.0
+        point.pose.orientation.w = 1.0
+        point.header.frame_id = "camera_link"
+        point.header.stamp = self.get_clock().now().to_msg()  # Timestamp required
+        self.publish_pose.publish(point)
+
+        target_x, target_y = self.transform_coordinates(point)
+
+        angle = np.radians(-4)
+        target_x_rot = target_x * np.cos(angle) - target_y * np.sin(angle)
+        target_y_rot = target_x * np.sin(angle) + target_y * np.cos(angle)
+
+        return target_x_rot, target_y_rot
 
     def camera_info_callback(self, msg):
-        try:
-            self.fx = msg.k[0]
-            self.fy = msg.k[4]
-            self.ppx = msg.k[2]
-            self.ppy = msg.k[5]
+        frame_id = msg.header.frame_id
+        if frame_id == "x500_depth_0/OakD-Lite/base_link/IMX214":
+            try:
+                self.fx = msg.k[0]
+                self.fy = msg.k[4]
+                self.ppx = msg.k[2]
+                self.ppy = msg.k[5]
 
-            # Initialize realsense intrinsics
-            self.intrinsics = rs2.intrinsics()
-            self.intrinsics.width = msg.width
-            self.intrinsics.height = msg.height
-            self.intrinsics.ppx = self.ppx
-            self.intrinsics.ppy = self.ppy
-            self.intrinsics.fx = self.fx
-            self.intrinsics.fy = self.fy
-            
-            if msg.distortion_model == 'plumb_bob':
-                self.intrinsics.model = rs2.distortion.brown_conrady
-            elif msg.distortion_model == 'equidistant':
-                self.intrinsics.model = rs2.distortion.kannala_brandt4
-                
-            self.intrinsics.coeffs = [i for i in msg.d]
-            
-            # self.get_logger().info("Camera intrinsics initialized")
-        except Exception as e:
-            self.get_logger().error(f'Camera info error: {str(e)}')
-            self.intrinsics = None
+            except Exception as e:
+                self.get_logger().error(f'Camera info error: {str(e)}')
 
     def get_heading(self, msg):
         # Convert quaternion to Euler angles
@@ -356,7 +399,8 @@ class FollowTarget(Node):
         siny_cosp = 2 * (q[0] * q[3] + q[1] * q[2])
         cosy_cosp = 1 - 2 * (q[2] * q[2] + q[3] * q[3])
         self.heading = math.atan2(siny_cosp, cosy_cosp)
-       
+        # print("im here too...")
+
     def velocity_controller(self, error):
         derivative = error - self.previous_error
         self.integral += error 
@@ -395,6 +439,10 @@ class FollowTarget(Node):
             self.target_hdg, 
             self.target_altitude)
 
+        # self.publish_data.Vx = Vx
+        # self.publish_data.Vy = Vy
+        # self.publish_data.Vz = Vz
+
         return trajectory_msg
 
     def Update_Objects(self, data, target_found):
@@ -405,6 +453,8 @@ class FollowTarget(Node):
     
         if not(target_found):
             my_target = next((obj for obj in self.detected_objects if obj.id == self.target_id), None)
+            # if my_target is None:
+            #     return None
                 
             my_target_position_increased = (my_target.center_x, my_target.center_y, my_target.size_x + 250, my_target.size_y + 150)
 
@@ -489,14 +539,15 @@ class FollowTarget(Node):
                 print("No suitable match found.", threshold, best_match_value)                
     
         return target_bbox
-    
+
+  
     def target_callback(self, data):
             print("-----------------------")
             # Process the target detection data and update self.target_position and self.target_detected
             # Extract the bounding box information from the message
 
             #___________________________________Kalman_Filter_______________________________________	
-            #Constant Velocity Model	
+            #Constante Velocity Model	
             current_time = time.time()
             dt = current_time - self.last_update_time_KF
             self.last_update_time_KF = current_time
@@ -536,7 +587,9 @@ class FollowTarget(Node):
                     print("target detected id first frame:\n", self.target_id)
                     self.first_detection = True
 
- 
+                    # new_object = Detected_Object(self.target_id,data.detections[0].bbox.center.x,data.detections[0].bbox.center.y,
+                    #                 data.detections[0].bbox.size_x,data.detections[0].bbox.size_y)
+                    
                     center = data.detections[0].bbox.center.position
                     size = data.detections[0].bbox
                     new_object = Detected_Object(
@@ -553,6 +606,10 @@ class FollowTarget(Node):
                 for detection in data.detections:
                     if detection.id == self.target_id:
                         target_found = 1
+                        #detection.bbox.center.x = self.KF.x[0]
+                        #print("target detected id:\n", detection.results[0].id)
+                #if not(target_found):
+                #	pass
                 if target_found==0:
                     target_found=False
                 elif target_found==1:
@@ -564,19 +621,28 @@ class FollowTarget(Node):
                 bounding_box = self.Update_Objects(data, target_found)	
 
                 if bounding_box is not None:
+                    #Get information from bbox
+                    # print("--------------------------------", bounding_box)
+                    # center_x = bounding_box.center.position.x
+                    # center_y = bounding_box.center.position.y
 
                     if hasattr(bounding_box.center, 'position'):
                         # Pose2D case
                         center_x = bounding_box.center.position.x
                         center_y = bounding_box.center.position.y
-                        # print(center_x)
                     else:
                         # Point case
                         center_x = bounding_box.center.x
                         center_y = bounding_box.center.y
-                        
+                        # print("NOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOO")
+                    
+                    # center_x = bounding_box.center.x
+                    # center_y = bounding_box.center.y
                     size_x = bounding_box.size_x
                     size_y = bounding_box.size_y
+
+                    # print("center", center_x)
+
 
                     if not(self.target_lost):
                         self.KF.update([center_x, center_y, size_x, size_y])
@@ -618,10 +684,13 @@ class FollowTarget(Node):
                     target_x, target_y = self.target_coordinates_test(value,center_x,center_y,self.heading)
                     self.KF_target.update([target_x, target_y])
 
-                    self.publish_data.target_x = float(target_x)
-                    self.publish_data.target_y = float(target_y)
+                    self.publish_data.target_x = target_x
+                    self.publish_data.target_y = target_y
                     self.publish_data.estimated_target_x = float(self.KF_target.x[0])
                     self.publish_data.estimated_target_y = float(self.KF_target.x[1])
+
+
+                    #print("---- estimated target pose ----\n", self.KF_target.x[0], self.KF_target.x[1])
 
                     estimated_distance = value
                     #print("estimated distance", estimated_distance)
@@ -646,17 +715,17 @@ class FollowTarget(Node):
                         print("ADJUSTING", self.target_id)				
                         # self.velocity_msg = self.create_velocity_msg(0, 0, 0, self.target_hdg, self.target_altitude, True)
                         #print("adjusting", self.target_hdg, self.target_altitude)	
-                        self.trajectory_setpoint = self.velocity_msg(0, 0, 0, self.target_hdg, self.target_altitude)
+                        self.trajectory_setpoint = self.create_trajectory_setpoint(0, 0, 0, self.target_hdg, self.target_altitude)
                 
                     elif self.target_lost and not(self.lost_counter.check_counting()) and self.lost_counter.is_lost():
                         print("---- LOST ----", self.target_id , self.lost_counter.counter)
                         
                         control_output = self.RateLimiter(0)
-                        self.publish_data.control_output = float(control_output)	
+                        self.publish_data.control_output = control_output	
                         Vx = math.cos(self.heading) * control_output
                         Vy = math.sin(self.heading) * control_output
                         # self.velocity_msg = self.create_velocity_msg(Vx, Vy, 0, 0, self.lost_altitude, True)
-                        self.trajectory_setpoint = self.velocity_msg(Vx, Vy, 0, 0, self.lost_altitude)
+                        self.trajectory_setpoint = self.create_trajectory_setpoint(Vx, Vy, 0, 0, self.lost_altitude)
     
                     else:
                         if self.target_lost:
@@ -669,7 +738,7 @@ class FollowTarget(Node):
                             print("---- REGULAR ----", self.target_id)
 
             else: #not(self.first_detection):
-                self.trajectory_setpoint = self.velocity_msg(0, 0, 0, 0.1, 4)
+                self.trajectory_setpoint = self.create_trajectory_setpoint(0, 0, 0, 0.1, 4)
                 
 
 def main(args=None):
@@ -678,7 +747,7 @@ def main(args=None):
     
     try:
         print("Starting spin...")  # Debug
-        rclpy.spin(follower)  
+        rclpy.spin(follower)  # ← THIS MUST RUN TO PROCESS CALLBACKS
     except KeyboardInterrupt:
         pass
     finally:
